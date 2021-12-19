@@ -1,4 +1,3 @@
-#!/usr/bin/python
 # -*- coding: utf-8 -*-
 from __future__ import absolute_import, division, print_function
 
@@ -32,8 +31,7 @@ description:
   VyOS. It allows playbooks to add or remote banner text from the active running configuration.
 version_added: 1.0.0
 notes:
-- Tested against VyOS 1.1.8 (helium).
-- This module works with connection C(network_cli). See L(the VyOS OS Platform Options,../network/user_guide/platform_vyos.html).
+- Tested against VyOS 1.3.0 (equuleus).
 options:
   banner:
     description:
@@ -57,6 +55,36 @@ options:
     choices:
     - present
     - absent
+  timeout:
+    description:
+      - The socket level timeout in seconds
+    type: int
+    default: 30
+  validate_certs:
+    description:
+      - If C(no), SSL certificates will not be validated.
+      - This should only set to C(no) used on personally controlled sites using self-signed certificates.
+    type: bool
+    default: yes
+  client_cert:
+    description:
+      - PEM formatted certificate chain file to be used for SSL client authentication.
+      - This file can also include the key as well, and if the key is included, I(client_key) is not required
+    type: path
+  client_key:
+    description:
+      - PEM formatted file that contains your private key to be used for SSL client authentication.
+      - If I(client_cert) contains both the certificate and key, this option is not required.
+    type: path
+  ca_path:
+    description:
+      - PEM formatted file that contains a CA certificate to be used for validation
+    type: path
+  use_proxy:
+    description:
+      - If C(no), it will not use a proxy, even if one is defined in an environment variable on the target hosts.
+    type: bool
+    default: yes
 extends_documentation_fragment:
 - vyos.vyos.vyos
 """
@@ -64,6 +92,8 @@ extends_documentation_fragment:
 EXAMPLES = """
 - name: configure the pre-login banner
   vyos.vyos.vyos_banner:
+    host: vyos.lab.local
+    key: '12345'
     banner: pre-login
     text: |
       this is my pre-login banner
@@ -88,110 +118,188 @@ commands:
     - string
 """
 
-import re
+import cgi
+import json
+import sys
 
 from ansible.module_utils.basic import AnsibleModule
-from ansible_collections.vyos.vyos.plugins.module_utils.network.vyos.vyos import (
-    get_config,
-    load_config,
-)
-from ansible_collections.vyos.vyos.plugins.module_utils.network.vyos.vyos import (
-    vyos_argument_spec,
-)
+from ansible.module_utils.six import PY2, PY3, iteritems
+from ansible.module_utils.six.moves.urllib.parse import urlencode
+from ansible.module_utils._text import to_text
+from ansible.module_utils.urls import fetch_url
+
+JSON_CANDIDATES = ('text', 'json', 'javascript')
+SKIP_KEYS = ('url', 'server', 'status', 'cookies', 'cookies_string', 'date',
+             'connection', 'content-type', 'content-length')
+
+def get_config(module, url, key, banner, socket_timeout, ca_path):
+    r = {}
+    headers = {}
+    body_part = {"op": "returnValues",
+                 "path": ["system", "login", "banner",
+                          banner]
+                }
+    payload = {'data': json.dumps(body_part),
+               'key': key}
+    resp, info = fetch_url(module, url, data=urlencode(payload), headers=headers,
+                           method='POST', timeout=socket_timeout,
+                           ca_path=ca_path)
+
+    try:
+        content = resp.read()
+    except AttributeError:
+        # there was no content, but the error read()
+        # may have been stored in the info as 'body'
+        content = info.pop('body', '')
+
+    r.update(info)
+
+    return r, content
 
 
-def spec_to_commands(updates, module):
+def check_config(resp, content, text, state):
+    uresp = {}
+    for key, value in iteritems(resp):
+        if key not in SKIP_KEYS:
+            ukey = key.replace("-", "_").lower()
+            uresp[ukey] = value
+
+    # Default content_encoding to try
+    content_encoding = 'utf-8'
+    configured = False
+    js = False
+    if 'content-type' in resp:
+        # Handle multiple Content-Type headers
+        content_types = []
+        for value in resp['content-type'].split(','):
+            ct, params = cgi.parse_header(value)
+            if ct not in content_types:
+                content_types.append(ct)
+
+        u_content = to_text(content, encoding=content_encoding)
+        if any(candidate in content_types[0] for candidate in JSON_CANDIDATES):
+            try:
+                js = json.loads(u_content)
+                if state == 'absent' and not js['data']:
+                    configured = True
+                elif state != 'absent' and js['data'] and js['data'][0] == text:
+                    configured = True
+            except Exception:
+                if PY2:
+                    sys.exc_clear()  # Avoid false positive traceback in fail_json() on Python 2
+
+    return uresp, js, configured
+
+
+def set_config(module, url, key, text, banner, state, socket_timeout, ca_path):
+    mode = 'set'
+    r = {}
+    headers = {}
+
+    if state == 'absent':
+        mode = 'delete'
+
+    body_part = {"op": mode,
+                 "path": ["system", "login", "banner",
+                          banner, text]
+                }
+    payload = {'data': json.dumps(body_part),
+               'key': key}
+    resp, info = fetch_url(module, url, data=urlencode(payload), headers=headers,
+                           method='POST', timeout=socket_timeout,
+                           ca_path=ca_path)
+
+    try:
+        content = resp.read()
+    except AttributeError:
+        # there was no content, but the error read()
+        # may have been stored in the info as 'body'
+        content = info.pop('body', '')
+
+    r.update(info)
+
+    return r, content
+
+
+def get_status(module, statuscode, **uresp):
+    if statuscode != 200:
+        uresp['msg'] = 'Status code was %s and not 200: %s' % (statuscode, uresp.get('msg', ''))
+        module.fail_json(**uresp)
+
+
+def spec_to_commands(configured, state, banner, text):
     commands = list()
-    want, have = updates
-    state = module.params["state"]
 
     if state == "absent":
-        if have.get("state") != "absent" or (
-            have.get("state") != "absent"
-            and "text" in have.keys()
-            and have["text"]
-        ):
+        if not configured:
             commands.append(
-                "delete system login banner %s" % module.params["banner"]
+                "delete system login banner %s" % banner
             )
 
     elif state == "present":
-        if want["text"] and want["text"].encode().decode(
-            "unicode_escape"
-        ) != have.get("text"):
+        if not configured:
             banner_cmd = (
-                "set system login banner %s " % module.params["banner"]
+                "set system login banner %s " % banner
             )
-            banner_cmd += want["text"].strip()
+            banner_cmd += "'%s'" % text
             commands.append(banner_cmd)
 
     return commands
 
 
-def config_to_dict(module):
-    data = get_config(module)
-    output = None
-    obj = {"banner": module.params["banner"], "state": "absent"}
-
-    for line in data.split("\n"):
-        if line.startswith("set system login banner %s" % obj["banner"]):
-            match = re.findall(r"%s (.*)" % obj["banner"], line, re.M)
-            output = match
-    if output:
-        obj["text"] = output[0].encode().decode("unicode_escape")
-        obj["state"] = "present"
-
-    return obj
-
-
-def map_params_to_obj(module):
-    text = module.params["text"]
-    if text:
-        text = "%r" % (str(text).strip())
-
-    return {
-        "banner": module.params["banner"],
-        "text": text,
-        "state": module.params["state"],
-    }
-
-
 def main():
     """main entry point for module execution"""
     argument_spec = dict(
-        banner=dict(required=True, choices=["pre-login", "post-login"]),
-        text=dict(),
-        state=dict(default="present", choices=["present", "absent"]),
+        host=dict(type='str'),
+        port=dict(type='int', default=443),
+        key=dict(type='str', no_log=True),
+        banner=dict(type='str', choices=['pre-login', 'post-login']),
+        text=dict(type='str'),
+        state=dict(type='str', default='present', choices=['present', 'absent']),
+        timeout=dict(type='int', default=30),
+        validate_certs=dict(type='bool', default=True),
+        client_cert=dict(type='path', default=None),
+        client_key=dict(type='path', default=None),
+        ca_path=dict(type='path', default=None),
+        use_proxy=dict(type='bool', default=True),
     )
-
-    argument_spec.update(vyos_argument_spec)
-
-    required_if = [("state", "present", ("text",))]
 
     module = AnsibleModule(
         argument_spec=argument_spec,
-        required_if=required_if,
-        supports_check_mode=True,
     )
 
-    warnings = list()
+    host = module.params['host']
+    port = module.params['port']
+    key = module.params['key']
+    banner = module.params['banner']
+    state = module.params['state']
+    socket_timeout = module.params['timeout']
+    ca_path = module.params['ca_path']
+    if PY3:
+        text = module.params['text'].rstrip().encode('unicode_escape').decode("utf-8")
+    else:
+        text = module.params['text'].rstrip().encode('string_escape').decode("utf-8")
 
-    result = {"changed": False}
-    if warnings:
-        result["warnings"] = warnings
+    url = "https://%s:%i/retrieve" % (host, port)
+    resp, content = get_config(module, url, key, banner, socket_timeout, ca_path)
+    resp['changed'] = False
+    uresp, js, configured = check_config(resp, content, text, state)
 
-    want = map_params_to_obj(module)
-    have = config_to_dict(module)
+    get_status(module, int(resp['status']), **uresp)
 
-    commands = spec_to_commands((want, have), module)
-    result["commands"] = commands
+    commands = spec_to_commands(configured, state, banner, text)
 
-    if commands:
-        commit = not module.check_mode
-        load_config(module, commands, commit=commit)
-        result["changed"] = True
+    if not configured:
+        url = "https://%s:%i/configure" % (host, port)
+        resp, content = set_config(module, url, key, text, banner, state, socket_timeout, ca_path)
+        resp['changed'] = True
 
-    module.exit_json(**result)
+        uresp, js, _ = check_config(resp, content, text, state)
+        get_status(module, int(resp['status']), **uresp)
+
+    uresp['commands'] = commands
+
+    module.exit_json(**uresp)
 
 
 if __name__ == "__main__":
