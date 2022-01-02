@@ -28,12 +28,23 @@
 from __future__ import absolute_import, division, print_function
 
 __metaclass__ = type
+import cgi
 import json
+import sys
 
 from ansible.module_utils._text import to_text
 from ansible.module_utils.basic import env_fallback
 from ansible.module_utils.connection import Connection, ConnectionError
+from ansible.module_utils.six import PY2
+from ansible.module_utils.six.moves.urllib.parse import urlencode
+from ansible.module_utils.common._collections_compat import Mapping
+from ansible.module_utils.urls import fetch_url
 
+from ansible_collections.ansible.netcommon.plugins.module_utils.network.common.utils import (
+    to_list,
+)
+
+JSON_CANDIDATES = ('text', 'json', 'javascript')
 _DEVICE_CONFIGS = {}
 
 vyos_provider_spec = {
@@ -104,6 +115,87 @@ def get_config(module, flags=None, format=None):
         cfg = to_text(out, errors="surrogate_then_replace").strip()
         _DEVICE_CONFIGS = cfg
         return cfg
+
+def api_command(module, mode, cmd):
+    host = module.params['host']
+    port = module.params['port']
+    key = module.params['key']
+    socket_timeout = module.params['timeout']
+    ca_path = module.params['ca_path']
+    CONFIG_MODE = ('set', 'delete', 'comment')
+
+    if mode in CONFIG_MODE:
+        uri = 'configure'
+    else:
+        uri = mode
+
+    url = "https://%s:%i/%s" % (host, port, uri)
+    r = {}
+    body_part = {"op": mode, "path": cmd['command']}
+    payload = {'data': json.dumps(body_part),
+               'key': key}
+    resp, info = fetch_url(module, url, data=urlencode(payload), headers={},
+                       method='POST', timeout=socket_timeout,
+                       ca_path=ca_path)
+
+    try:
+        content = resp.read()
+    except AttributeError:
+        # there was no content, but the error read()
+        # may have been stored in the info as 'body'
+        content = info.pop('body', '')
+
+    r.update(info)
+
+    return r, content
+
+def parse_commands(module, resp, content):
+    uresp = {}
+    content_encoding = 'utf-8'
+
+    if 'content-type' in resp:
+        # Handle multiple Content-Type headers
+        content_types = []
+        for value in resp['content-type'].split(','):
+            ct, params = cgi.parse_header(value)
+            if ct not in content_types:
+                content_types.append(ct)
+
+        u_content = to_text(content, encoding=content_encoding)
+        if any(candidate in content_types[0] for candidate in JSON_CANDIDATES):
+            try:
+                js = json.loads(u_content)
+                uresp['json'] = js
+                if int(resp['status']) not in (200, 400):
+                    msg = uresp['json']['error']
+                    module.fail_json(msg)
+            except Exception:
+                if PY2:
+                    sys.exc_clear()  # Avoid false positive traceback in fail_json() on Python 2
+    else:
+        module.fail_json(resp['msg'])
+
+    return uresp
+
+def run_api_commands(module, commands=None):
+    if commands is None:
+        raise ValueError("'commands' value is required")
+
+    responses = list()
+    for cmd in to_list(commands):
+        if not isinstance(cmd, Mapping):
+            cmd = {"command": cmd.split()}
+
+        mode = cmd['command'].pop(0)
+        resp, content = api_command(module, mode, cmd)
+        uresp = parse_commands(module, resp, content)
+        if uresp['json']['success']:
+            if uresp['json']['data']:
+                responses.append(uresp['json']['data'])
+        else:
+            responses.append(uresp['json']['error'])
+
+    return responses
 
 
 def run_commands(module, commands, check_rc=True):
