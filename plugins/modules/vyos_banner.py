@@ -33,6 +33,21 @@ version_added: 1.0.0
 notes:
 - Tested against VyOS 1.3.0 (equuleus).
 options:
+  host:
+    description:
+    - The host to connect to.
+    required: true
+    type: str
+  key:
+    description:
+    - The api secret key used for the connection.
+    required: true
+    type: str
+  port:
+    description:
+    - The port the hosts listens on for the connection.
+    type: int
+    default: 443
   banner:
     description:
     - Specifies which banner that should be configured on the remote device.
@@ -94,6 +109,7 @@ EXAMPLES = """
   vyos.vyos.vyos_banner:
     host: vyos.lab.local
     key: '12345'
+    validate_certs: False
     banner: pre-login
     text: |
       this is my pre-login banner
@@ -250,9 +266,9 @@ def spec_to_commands(configured, state, banner, text):
 def main():
     """main entry point for module execution"""
     argument_spec = dict(
-        host=dict(type='str'),
+        host=dict(type='str', required=True),
         port=dict(type='int', default=443),
-        key=dict(type='str', no_log=True),
+        key=dict(type='str', no_log=True, required=True),
         banner=dict(type='str', choices=['pre-login', 'post-login']),
         text=dict(type='str'),
         state=dict(type='str', default='present', choices=['present', 'absent']),

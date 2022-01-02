@@ -33,6 +33,21 @@ version_added: 2.7.0
 extends_documentation_fragment:
 - vyos.vyos.vyos
 options:
+  host:
+    description:
+    - The host to connect to.
+    required: true
+    type: str
+  key:
+    description:
+    - The api secret key used for the connection.
+    required: true
+    type: str
+  port:
+    description:
+    - The port the hosts listens on for the connection.
+    type: int
+    default: 443
   commands:
     description:
     - The ordered set of commands to execute on the remote device running VyOS.  The
@@ -77,6 +92,36 @@ options:
       how long to wait before trying the command again.
     default: 1
     type: int
+  timeout:
+    description:
+      - The socket level timeout in seconds
+    type: int
+    default: 30
+  validate_certs:
+    description:
+      - If C(no), SSL certificates will not be validated.
+      - This should only set to C(no) used on personally controlled sites using self-signed certificates.
+    type: bool
+    default: yes
+  client_cert:
+    description:
+      - PEM formatted certificate chain file to be used for SSL client authentication.
+      - This file can also include the key as well, and if the key is included, I(client_key) is not required
+    type: path
+  client_key:
+    description:
+      - PEM formatted file that contains your private key to be used for SSL client authentication.
+      - If I(client_cert) contains both the certificate and key, this option is not required.
+    type: path
+  ca_path:
+    description:
+      - PEM formatted file that contains a CA certificate to be used for validation
+    type: path
+  use_proxy:
+    description:
+      - If C(no), it will not use a proxy, even if one is defined in an environment variable on the target hosts.
+    type: bool
+    default: yes
 notes:
 - Tested against VyOS 1.3.0 (equuleus).
 """
@@ -84,7 +129,7 @@ notes:
 EXAMPLES = """
 - name: show configuration on ethernet devices eth0 and eth1
   vyos.vyos.vyos_api_command:
-    host: 192.168.1.1
+    host: vyos.lab.local
     key: 12345
     validate_certs: False
     commands:
@@ -96,14 +141,14 @@ EXAMPLES = """
 - name: run multiple commands and check if version output contains specific version
     string
   vyos.vyos.vyos_api_command:
-    host: 192.168.1.1
+    host: vyos.lab.local
     key: 12345
     validate_certs: False
     commands:
     - show version
     - show hardware cpu
     wait_for:
-    - result[0] contains 'VyOS 1.1.7'
+    - result[0] contains 'VyOS 1.3.0'
 """
 
 RETURN = """
