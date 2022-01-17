@@ -184,7 +184,6 @@ from ansible_collections.ansible.netcommon.plugins.module_utils.network.common.u
     to_lines,
 )
 from ansible_collections.vyos.vyos.plugins.module_utils.network.vyos.vyos import (
-    run_commands,
     run_api_commands,
 )
 from ansible_collections.vyos.vyos.plugins.module_utils.network.vyos.vyos import (
@@ -239,6 +238,7 @@ def main():
     result = {"changed": False, "warnings": warnings}
     commands = parse_commands(module, warnings)
     wait_for = module.params["wait_for"] or list()
+    direct_fail = False
 
     try:
         conditionals = [Conditional(c) for c in wait_for]
@@ -254,7 +254,7 @@ def main():
     match = module.params["match"]
 
     for item in range(retries):
-        responses = run_api_commands(module, commands)
+        responses = run_api_commands(module, commands, direct_fail)
 
         for item in list(conditionals):
             if item(responses):

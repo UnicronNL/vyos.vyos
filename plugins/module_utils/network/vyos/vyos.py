@@ -39,7 +39,9 @@ from ansible.module_utils.six import PY2
 from ansible.module_utils.six.moves.urllib.parse import urlencode
 from ansible.module_utils.common._collections_compat import Mapping
 from ansible.module_utils.urls import fetch_url
-
+from ansible_collections.ansible.netcommon.plugins.module_utils.network.common.config import (
+    NetworkConfig,
+)
 from ansible_collections.ansible.netcommon.plugins.module_utils.network.common.utils import (
     to_list,
 )
@@ -107,14 +109,130 @@ def get_config(module, flags=None, format=None):
     if _DEVICE_CONFIGS != {}:
         return _DEVICE_CONFIGS
     else:
-        connection = get_connection(module)
+        commands = ['show configuration commands']
         try:
-            out = connection.get_config(flags=flags, format=format)
+            out = run_api_commands(module, commands)
         except ConnectionError as exc:
             module.fail_json(msg=to_text(exc, errors="surrogate_then_replace"))
-        cfg = to_text(out, errors="surrogate_then_replace").strip()
+        cfg = to_text(out[0], errors="surrogate_then_replace").strip()
         _DEVICE_CONFIGS = cfg
         return cfg
+
+
+def get_device_operations():
+    return {
+        "supports_diff_replace": False,
+        "supports_commit": True,
+        "supports_rollback": False,
+        "supports_defaults": False,
+        "supports_onbox_diff": True,
+        "supports_commit_comment": True,
+        "supports_multiline_delimiter": False,
+        "supports_diff_match": True,
+        "supports_diff_ignore_lines": False,
+        "supports_generate_diff": False,
+        "supports_replace": False,
+    }
+
+
+def get_option_values():
+    return {
+        "format": ["text", "set"],
+        "diff_match": ["line", "none"],
+        "diff_replace": [],
+        "output": [],
+    }
+
+
+def get_diff(
+    candidate=None,
+    running=None,
+    diff_match="line",
+    diff_ignore_lines=None,
+    path=None,
+    diff_replace=None,
+):
+    diff = {}
+    device_operations = get_device_operations()
+    option_values = get_option_values()
+
+    if candidate is None and device_operations["supports_generate_diff"]:
+        raise ValueError(
+            "candidate configuration is required to generate diff"
+        )
+
+    if diff_match not in option_values["diff_match"]:
+        raise ValueError(
+            "'match' value %s in invalid, valid values are %s"
+            % (diff_match, ", ".join(option_values["diff_match"]))
+        )
+
+    if diff_replace:
+        raise ValueError("'replace' in diff is not supported")
+
+    if diff_ignore_lines:
+        raise ValueError("'diff_ignore_lines' in diff is not supported")
+
+    if path:
+        raise ValueError("'path' in diff is not supported")
+
+    set_format = candidate.startswith("set") or candidate.startswith(
+        "delete"
+    )
+    candidate_obj = NetworkConfig(indent=4, contents=candidate)
+    if not set_format:
+        config = [c.line for c in candidate_obj.items]
+        commands = list()
+        # this filters out less specific lines
+        for item in config:
+            for index, entry in enumerate(commands):
+                if item.startswith(entry):
+                    del commands[index]
+                    break
+            commands.append(item)
+
+        candidate_commands = [
+            "set %s" % cmd.replace(" {", "") for cmd in commands
+        ]
+
+    else:
+        candidate_commands = str(candidate).strip().split("\n")
+
+    if diff_match == "none":
+        diff["config_diff"] = list(candidate_commands)
+        return diff
+
+    running_commands = [
+        str(c).replace("'", "") for c in running.splitlines()
+    ]
+
+    updates = list()
+    visited = set()
+
+    for line in candidate_commands:
+        item = str(line).replace("'", "")
+
+        if not item.startswith("set") and not item.startswith("delete"):
+            raise ValueError(
+                "line must start with either `set` or `delete`"
+            )
+
+        elif item.startswith("set") and item not in running_commands:
+            updates.append(line)
+
+        elif item.startswith("delete"):
+            if not running_commands:
+                updates.append(line)
+            else:
+                item = re.sub(r"delete", "set", item)
+                for entry in running_commands:
+                    if entry.startswith(item) and line not in visited:
+                        updates.append(line)
+                        visited.add(line)
+
+    diff["config_diff"] = list(updates)
+    return diff
+
 
 def api_command(module, mode, cmd):
     host = module.params['host']
@@ -149,7 +267,8 @@ def api_command(module, mode, cmd):
 
     return r, content
 
-def parse_commands(module, resp, content):
+
+def parse_commands(module, resp, content, direct_fail):
     uresp = {}
     content_encoding = 'utf-8'
 
@@ -166,6 +285,9 @@ def parse_commands(module, resp, content):
             try:
                 js = json.loads(u_content)
                 uresp['json'] = js
+                if int(resp['status']) != 200 and direct_fail:
+                    msg = uresp['json']['error']
+                    module.fail_json(msg)
                 if int(resp['status']) not in (200, 400):
                     msg = uresp['json']['error']
                     module.fail_json(msg)
@@ -177,7 +299,8 @@ def parse_commands(module, resp, content):
 
     return uresp
 
-def run_api_commands(module, commands=None):
+
+def run_api_commands(module, commands=None, direct_fail=True):
     if commands is None:
         raise ValueError("'commands' value is required")
 
@@ -188,7 +311,7 @@ def run_api_commands(module, commands=None):
 
         mode = cmd['command'].pop(0)
         resp, content = api_command(module, mode, cmd)
-        uresp = parse_commands(module, resp, content)
+        uresp = parse_commands(module, resp, content, direct_fail)
         if uresp['json']['success']:
             if uresp['json']['data']:
                 responses.append(uresp['json']['data'])

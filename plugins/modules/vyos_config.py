@@ -33,11 +33,25 @@ version_added: 1.0.0
 extends_documentation_fragment:
 - vyos.vyos.vyos
 notes:
-- Tested against VyOS 1.1.8 (helium).
-- This module works with connection C(network_cli). See L(the VyOS OS Platform Options,../network/user_guide/platform_vyos.html).
+- Tested against VyOS 1.3.0 (equuleus).
 - To ensure idempotency and correct diff the configuration lines in the relevant module options should be similar to how they
   appear if present in the running configuration on device including the indentation.
 options:
+  host:
+    description:
+    - The host to connect to.
+    required: true
+    type: str
+  key:
+    description:
+    - The api secret key used for the connection.
+    required: true
+    type: str
+  port:
+    description:
+    - The port the hosts listens on for the connection.
+    type: int
+    default: 443
   lines:
     description:
     - The ordered set of commands that should be configured in the section. The commands
@@ -76,13 +90,6 @@ options:
       ansible role. If the directory does not exist, it is created.
     type: bool
     default: no
-  comment:
-    description:
-    - Allows a commit description to be specified to be included when the configuration
-      is committed.  If the configuration is not changed or committed, this argument
-      is ignored.
-    default: configured by vyos_config
-    type: str
   config:
     description:
     - The C(config) argument specifies the base configuration to use to compare against
@@ -92,13 +99,6 @@ options:
       will appear if present in the running-configuration of the device including indentation
       to ensure idempotency and correct diff.
     type: str
-  save:
-    description:
-    - The C(save) argument controls whether or not changes made to the active configuration
-      are saved to disk.  This is independent of committing the config.  When set
-      to True, the active configuration is saved.
-    type: bool
-    default: no
   backup_options:
     description:
     - This is a dict object containing configurable options related to backup file
@@ -122,6 +122,36 @@ options:
           in C(filename) within I(backup) directory.
         type: path
     type: dict
+  timeout:
+    description:
+      - The socket level timeout in seconds
+    type: int
+    default: 30
+  validate_certs:
+    description:
+      - If C(no), SSL certificates will not be validated.
+      - This should only set to C(no) used on personally controlled sites using self-signed certificates.
+    type: bool
+    default: yes
+  client_cert:
+    description:
+      - PEM formatted certificate chain file to be used for SSL client authentication.
+      - This file can also include the key as well, and if the key is included, I(client_key) is not required
+    type: path
+  client_key:
+    description:
+      - PEM formatted file that contains your private key to be used for SSL client authentication.
+      - If I(client_cert) contains both the certificate and key, this option is not required.
+    type: path
+  ca_path:
+    description:
+      - PEM formatted file that contains a CA certificate to be used for validation
+    type: path
+  use_proxy:
+    description:
+      - If C(no), it will not use a proxy, even if one is defined in an environment variable on the target hosts.
+    type: bool
+    default: yes
 """
 
 EXAMPLES = """
@@ -196,19 +226,15 @@ import re
 
 from ansible.module_utils._text import to_text
 from ansible.module_utils.basic import AnsibleModule
-from ansible.module_utils.connection import ConnectionError
 from ansible_collections.vyos.vyos.plugins.module_utils.network.vyos.vyos import (
-    load_config,
     get_config,
-    run_commands,
+    run_api_commands,
+    get_diff,
 )
 from ansible_collections.vyos.vyos.plugins.module_utils.network.vyos.vyos import (
     vyos_argument_spec,
-    get_connection,
 )
 
-
-DEFAULT_COMMENT = "configured by vyos_config"
 
 CONFIG_FILTERS = [
     re.compile(r"set system login user \S+ authentication encrypted-password")
@@ -249,7 +275,7 @@ def diff_config(commands, config):
     updates = list()
     visited = set()
 
-    for line in commands:
+    for linu in commands:
         item = str(line).replace("'", "")
 
         if not item.startswith("set") and not item.startswith("delete"):
@@ -284,7 +310,7 @@ def sanitize_config(config, result):
         del config[filter_index]
 
 
-def run(module, result):
+def run(module, result, direct_fail=True):
     # get the current active config from the node or passed in via
     # the config param
     config = module.params["config"] or get_config(module)
@@ -293,9 +319,8 @@ def run(module, result):
     candidate = get_candidate(module)
 
     # create loadable config that includes only the configuration updates
-    connection = get_connection(module)
     try:
-        response = connection.get_diff(
+        response = get_diff(
             candidate=candidate,
             running=config,
             diff_match=module.params["match"],
@@ -308,12 +333,9 @@ def run(module, result):
 
     result["commands"] = commands
 
-    commit = not module.check_mode
-    comment = module.params["comment"]
-
     diff = None
     if commands:
-        diff = load_config(module, commands, commit=commit, comment=comment)
+        diff = run_api_commands(module, commands, direct_fail)
 
         if result.get("filtered"):
             result["warnings"].append(
@@ -330,14 +352,21 @@ def run(module, result):
 def main():
     backup_spec = dict(filename=dict(), dir_path=dict(type="path"))
     argument_spec = dict(
+        host=dict(type='str', required=True),
+        port=dict(type='int', default=443),
+        key=dict(type='str', no_log=True),
+        timeout=dict(type='int', default=30),
+        validate_certs=dict(type='bool', default=True),
+        client_cert=dict(type='path', default=None),
+        client_key=dict(type='path', default=None),
+        ca_path=dict(type='path', default=None),
+        use_proxy=dict(type='bool', default=True),
         src=dict(type="path"),
         lines=dict(type="list", elements="str"),
         match=dict(default="line", choices=["line", "none"]),
-        comment=dict(default=DEFAULT_COMMENT),
         config=dict(),
         backup=dict(type="bool", default=False),
         backup_options=dict(type="dict", options=backup_spec),
-        save=dict(type="bool", default=False),
     )
 
     argument_spec.update(vyos_argument_spec)
@@ -347,7 +376,7 @@ def main():
     module = AnsibleModule(
         argument_spec=argument_spec,
         mutually_exclusive=mutually_exclusive,
-        supports_check_mode=True,
+        supports_check_mode=False,
     )
 
     warnings = list()
@@ -360,17 +389,8 @@ def main():
     if any((module.params["src"], module.params["lines"])):
         run(module, result)
 
-    if module.params["save"]:
-        diff = run_commands(module, commands=["configure", "compare saved"])[1]
-        if diff != "[edit]":
-            if not module.check_mode:
-                run_commands(module, commands=["save"])
-            result["changed"] = True
-        run_commands(module, commands=["exit"])
-
     if result.get("changed") and any(
-        (module.params["src"], module.params["lines"])
-    ):
+        (module.params["src"], module.params["lines"])):
         msg = (
             "To ensure idempotency and correct diff the input configuration lines should be"
             " similar to how they appear if present in"
